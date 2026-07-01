@@ -42,9 +42,16 @@ jobs:
       - name: Source manifest and run e2e
         run: |
           set -euo pipefail
+          echo "=== Sourcing manifest ==="
           source verify/manifest.env
+          echo "=== Installing test deps ==="
           eval "$TEST_DEPS"
+          echo "=== Bringing stack UP ==="
           eval "$UP"
+          echo "=== Waiting for READY ==="
           eval "$READY"
+          echo "=== Running ACCEPTANCE tests ==="
           eval "$ACCEPTANCE"
+          echo "=== Tearing DOWN ==="
           eval "$DOWN"
+          echo "=== DONE ==="
