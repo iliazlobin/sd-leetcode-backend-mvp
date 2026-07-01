@@ -69,12 +69,19 @@ jobs:
           set -euo pipefail
           uvicorn leetcode.main:app --host 0.0.0.0 --port 8000 &
           SERVER_PID=$!
+          HEALTHY=0
           for i in $(seq 1 30); do
             if curl -sf http://localhost:8000/healthz >/dev/null 2>&1; then
               echo "Server ready after ${i}s"
+              HEALTHY=1
               break
             fi
             sleep 1
           done
+          if [ "$HEALTHY" -eq 0 ]; then
+            echo "ERROR: Server failed to start within 30s"
+            kill $SERVER_PID 2>/dev/null || true
+            exit 1
+          fi
           API_BASE_URL=http://localhost:8000 pytest verify/acceptance/ -v
           kill $SERVER_PID 2>/dev/null || true
