@@ -67,7 +67,7 @@ jobs:
           JWT_SECRET: change-me-in-production
         run: |
           set -euo pipefail
-          uvicorn leetcode.main:app --host 0.0.0.0 --port 8000 &
+          uvicorn leetcode.main:app --host 0.0.0.0 --port 8000 > /tmp/server.log 2>&1 &
           SERVER_PID=$!
           HEALTHY=0
           for i in $(seq 1 30); do
@@ -80,8 +80,15 @@ jobs:
           done
           if [ "$HEALTHY" -eq 0 ]; then
             echo "ERROR: Server failed to start within 30s"
+            echo "=== Server log ==="
+            cat /tmp/server.log
             kill $SERVER_PID 2>/dev/null || true
             exit 1
           fi
-          API_BASE_URL=http://localhost:8000 pytest verify/acceptance/ -v
+          API_BASE_URL=http://localhost:8000 pytest verify/acceptance/ -v --tb=short || {
+            echo "=== Server log (tests failed) ==="
+            cat /tmp/server.log
+            kill $SERVER_PID 2>/dev/null || true
+            exit 1
+          }
           kill $SERVER_PID 2>/dev/null || true
