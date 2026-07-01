@@ -23,10 +23,12 @@ def upgrade() -> None:
         INSERT INTO users (username, password_hash, role) VALUES
         ('admin', '$2b$12$Xk4/Zsei//ufzbDQhb/5I.HP/DL4M36Zu2hfNoMQQZ73E5wLGqJrG', 'admin'),
         ('alice', '$2b$12$IYuqeuIilqvjOfLFSftJL.rUxrBNsXbhl9CTQKlU8.eZZx2ljAutG', 'user'),
-        ('bob',   '$2b$12$0BuwWf70uDDmctGES6laAukIlwSrSkxIxaYl5DI8Iz8u5p8VFA/qW', 'user')
+        ('bob',   '$2b$12$0BuwWf70uDDmctGES6laAukIlwSrSkxIxaYl5DI8Iz8u5p8VFA/qW', 'user'),
+        ('charlie', '$2b$12$0BuwWf70uDDmctGES6laAukIlwSrSkxIxaYl5DI8Iz8u5p8VFA/qW', 'user'),
+        ('dave', '$2b$12$0BuwWf70uDDmctGES6laAukIlwSrSkxIxaYl5DI8Iz8u5p8VFA/qW', 'user')
         """
     )
 
 
 def downgrade() -> None:
-    op.execute("DELETE FROM users WHERE username IN ('admin', 'alice', 'bob')")
+    op.execute("DELETE FROM users WHERE username IN ('admin', 'alice', 'bob', 'charlie', 'dave')")

@@ -26,6 +26,10 @@ TEST_USER_USERNAME = os.environ.get("TEST_USER_USERNAME", "alice")
 TEST_USER_PASSWORD = os.environ.get("TEST_USER_PASSWORD", "alice123")
 TEST_USER2_USERNAME = os.environ.get("TEST_USER2_USERNAME", "bob")
 TEST_USER2_PASSWORD = os.environ.get("TEST_USER2_PASSWORD", "bob123")
+TEST_USER3_USERNAME = os.environ.get("TEST_USER3_USERNAME", "charlie")
+TEST_USER3_PASSWORD = os.environ.get("TEST_USER3_PASSWORD", "bob123")
+TEST_USER4_USERNAME = os.environ.get("TEST_USER4_USERNAME", "dave")
+TEST_USER4_PASSWORD = os.environ.get("TEST_USER4_PASSWORD", "bob123")
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -93,6 +97,40 @@ def user2_token(client):
 def user2_headers(user2_token):
     """Authorization header dict for second user requests."""
     return {"Authorization": f"Bearer {user2_token}"}
+
+
+@pytest.fixture(scope="session")
+def user3_token(client):
+    """Obtain third regular user JWT token once per session."""
+    r = client.post("/auth/token", json={
+        "username": TEST_USER3_USERNAME,
+        "password": TEST_USER3_PASSWORD,
+    })
+    assert r.status_code == 200, f"User3 login failed: {r.status_code} {r.text}"
+    return r.json()["access_token"]
+
+
+@pytest.fixture(scope="session")
+def user3_headers(user3_token):
+    """Authorization header dict for third user requests."""
+    return {"Authorization": f"Bearer {user3_token}"}
+
+
+@pytest.fixture(scope="session")
+def user4_token(client):
+    """Obtain fourth regular user JWT token once per session."""
+    r = client.post("/auth/token", json={
+        "username": TEST_USER4_USERNAME,
+        "password": TEST_USER4_PASSWORD,
+    })
+    assert r.status_code == 200, f"User4 login failed: {r.status_code} {r.text}"
+    return r.json()["access_token"]
+
+
+@pytest.fixture(scope="session")
+def user4_headers(user4_token):
+    """Authorization header dict for fourth user requests."""
+    return {"Authorization": f"Bearer {user4_token}"}
 
 
 # ---------------------------------------------------------------------------

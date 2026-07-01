@@ -87,6 +87,13 @@ async def execute_code(
         memory_kb = _get_peak_memory()
 
         if proc.returncode != 0:
+            if proc.returncode < 0:
+                # Killed by signal — RLIMIT_CPU (SIGXCPU) or RLIMIT_AS (SIGKILL).
+                # Both are resource limits and should be treated as timeout,
+                # because the primary timeout (asyncio.wait_for) didn't fire.
+                raise SandboxTimeout(
+                    f"Process terminated by signal {-proc.returncode}"
+                ) from None
             raise SandboxError(stderr)
 
         return stdout, stderr, runtime_ms, memory_kb

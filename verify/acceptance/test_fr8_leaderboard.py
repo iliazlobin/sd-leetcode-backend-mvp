@@ -74,8 +74,12 @@ def test_leaderboard_ranked_by_problems_solved(client, admin_headers, user_heade
         assert entry["problems_solved"] >= 0
 
 
-def test_leaderboard_tie_break_by_timestamp(client, admin_headers, user_headers, user2_headers):
-    """Two users with same problems_solved → earlier last_solved_at ranks higher."""
+def test_leaderboard_tie_break_by_timestamp(client, admin_headers, user3_headers, user4_headers):
+    """Two users with same problems_solved → earlier last_solved_at ranks higher.
+
+    Uses charlie and dave (fresh users, no prior submissions) so we control
+    their exact leaderboard counts without interference from other tests.
+    """
     prob = create_problem(
         client, admin_headers,
         title=None,
@@ -85,29 +89,29 @@ def test_leaderboard_tie_break_by_timestamp(client, admin_headers, user_headers,
         ],
     )
 
-    # User 2 solves first (earlier timestamp)
-    sub2 = submit_solution(client, user2_headers, prob["problem_id"], CORRECT_CODE)
-    poll_verdict(client, user2_headers, sub2["submission_id"], timeout_seconds=15)
+    # Dave (user4) solves first (earlier timestamp)
+    sub4 = submit_solution(client, user4_headers, prob["problem_id"], CORRECT_CODE)
+    poll_verdict(client, user4_headers, sub4["submission_id"], timeout_seconds=15)
 
-    # User 1 solves later
-    sub1 = submit_solution(client, user_headers, prob["problem_id"], CORRECT_CODE)
-    poll_verdict(client, user_headers, sub1["submission_id"], timeout_seconds=15)
+    # Charlie (user3) solves later
+    sub3 = submit_solution(client, user3_headers, prob["problem_id"], CORRECT_CODE)
+    poll_verdict(client, user3_headers, sub3["submission_id"], timeout_seconds=15)
 
     r = client.get("/leaderboard", params={"page": 1, "limit": 100})
     body = assert_200(r)
 
-    # Find both users in entries
-    user1_entry = next((e for e in body["entries"] if e["problems_solved"] == 1), None)
-
-    # Both have 1 solved; the tie-break should place user2 before user1
-    usernames = [e["username"] for e in body["entries"] if e["problems_solved"] == 1]
-    assert len(usernames) >= 2, f"Expected at least 2 users with 1 solved, got {usernames}"
-    # User2 (bob, solved first) should appear before User1 (alice, solved later)
-    idx2 = usernames.index("bob") if "bob" in usernames else -1
-    idx1 = usernames.index("alice") if "alice" in usernames else -1
-    assert idx2 != -1 and idx1 != -1, f"Both users should appear in leaderboard: {usernames}"
-    assert idx2 < idx1, \
-        f"User2 (bob, earlier timestamp) should rank before User1 (alice, later): {usernames}"
+    # Both have exactly 1 solved — the tie-break should place dave before charlie
+    entries_with_1 = [e for e in body["entries"] if e["problems_solved"] == 1]
+    usernames = [e["username"] for e in entries_with_1]
+    assert len(usernames) >= 2, \
+        f"Expected at least 2 users with 1 solved, got {usernames}"
+    # Dave (solved first) should appear before Charlie (solved later)
+    idx_dave = usernames.index("dave") if "dave" in usernames else -1
+    idx_charlie = usernames.index("charlie") if "charlie" in usernames else -1
+    assert idx_dave != -1 and idx_charlie != -1, \
+        f"Both users should appear with 1 solved: {usernames}"
+    assert idx_dave < idx_charlie, \
+        f"Dave (earlier timestamp) should rank before Charlie (later): {usernames}"
 
 
 def test_leaderboard_pagination(client, admin_headers, user_headers):
