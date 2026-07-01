@@ -23,35 +23,58 @@ jobs:
 
   e2e:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: leetcode
+          POSTGRES_PASSWORD: leetcode
+          POSTGRES_DB: leetcode
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U leetcode"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install docker compose
+      - name: Install deps
         run: |
-          # GitHub Actions ubuntu-latest has docker daemon but compose plugin
-          # may be absent. Install standalone compose binary.
-          if ! docker compose version >/dev/null 2>&1; then
-            DOCKER_CONFIG="${DOCKER_CONFIG:-$HOME/.docker}"
-            mkdir -p "$DOCKER_CONFIG/cli-plugins"
-            curl -sSL "https://github.com/docker/compose/releases/download/v2.33.1/docker-compose-$(uname -s)-$(uname -m)" -o "$DOCKER_CONFIG/cli-plugins/docker-compose"
-            chmod +x "$DOCKER_CONFIG/cli-plugins/docker-compose"
-          fi
-          docker compose version
-      - name: Source manifest and run e2e
+          python -m pip install -e ".[dev]"
+          python -m pip install psycopg2-binary
+      - name: Run migrations
+        env:
+          DATABASE_URL: postgresql+psycopg2://leetcode:leetcode@localhost:5432/leetcode
+        run: alembic upgrade head
+      - name: Start server and run acceptance tests
+        env:
+          DATABASE_URL: postgresql+asyncpg://leetcode:leetcode@localhost:5432/leetcode
+          REDIS_URL: redis://localhost:6379/0
+          JWT_SECRET: change-me-in-production
         run: |
           set -euo pipefail
-          echo "=== Sourcing manifest ==="
-          source verify/manifest.env
-          echo "=== Installing test deps ==="
-          eval "$TEST_DEPS"
-          echo "=== Bringing stack UP ==="
-          eval "$UP"
-          echo "=== Waiting for READY ==="
-          eval "$READY"
-          echo "=== Running ACCEPTANCE tests ==="
-          eval "$ACCEPTANCE"
-          echo "=== Tearing DOWN ==="
-          eval "$DOWN"
-          echo "=== DONE ==="
+          uvicorn leetcode.main:app --host 0.0.0.0 --port 8000 &
+          SERVER_PID=$!
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8000/healthz >/dev/null 2>&1; then
+              echo "Server ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          API_BASE_URL=http://localhost:8000 pytest verify/acceptance/ -v
+          kill $SERVER_PID 2>/dev/null || true
