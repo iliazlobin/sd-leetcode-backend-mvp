@@ -4,17 +4,15 @@ from typing import Any
 
 from fastapi import FastAPI
 
-from .database import Base, _get_engine, _get_redis, _get_session_factory
+from .database import _get_engine, _get_redis, _get_session_factory
 from .routers import auth, health, leaderboard, problems, submissions
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> Any:
-    # Create tables for dev convenience (PostgreSQL — models use postgresql.UUID/ARRAY).
-    # Production uses Alembic migrations via docker compose.
+    # Schema is managed by Alembic migrations (docker compose UP runs alembic upgrade head
+    # before starting the app). create_all() is deliberately absent — it skips seed migrations.
     engine = _get_engine()
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
     
     # Start judge worker as background task
     from judge.worker import run_judge_loop

@@ -13,16 +13,26 @@
 git clone <repo-url> && cd sd-leetcode-backend-mvp
 cp .env.example .env          # edit if you need custom ports/secrets
 
-# 2. Bring the stack up (builds image, starts postgres + redis + app)
-docker compose up --build -d
+# 2. Build the image, then start db + redis (NOT the app yet)
+docker compose build
+docker compose up -d db redis
 
-# 3. Wait for healthy, then run migrations + seed
-docker compose exec app alembic upgrade head
+# 3. Wait for PostgreSQL to be ready, then run migrations (schema + admin seed)
+until docker compose exec -T db pg_isready -U leetcode; do sleep 1; done
+docker compose run --rm -T app alembic -c /app/alembic.ini upgrade head
 
-# 4. Verify the API is responding
+# 4. Start the app (now that the DB is migrated and seeded)
+docker compose up -d app
+
+# 5. Verify the API is responding
 curl http://localhost:${APP_PORT:-8010}/healthz
 # → {"status":"ok"}
 ```
+
+> **Why the phased bring-up?** The app no longer calls `create_all()` on startup —
+> Alembic owns the schema end-to-end. Migration `002_seed_users.py` seeds the admin
+> user that acceptance tests need. Running `alembic upgrade head` BEFORE the app
+> starts ensures the seed runs on a fresh DB and avoids `DuplicateTableError`.
 
 ## Architecture
 
@@ -42,37 +52,21 @@ See `.env.example` for the full list. Key variables:
 |----------------|------------------------------------------------------------|----------------------------|
 | `DATABASE_URL` | `postgresql+asyncpg://leetcode:leetcode@db:5432/leetcode`  | Async PG connection        |
 | `REDIS_URL`    | `redis://redis:6379/0`                                     | Redis connection           |
-| `JWT_SECRET`   | `change-me-to-a-random-secret`                             | JWT signing key            |
+| `JWT_SECRET`   | `change-me-in-production`                                  | JWT signing key            |
 | `APP_PORT`     | `8010`                                                     | Host port for the API      |
-
-## Running Migrations
-
-```bash
-docker compose exec app alembic upgrade head
-```
-
-## Seeding Data
-
-```bash
-docker compose exec app python scripts/seed.py
-```
 
 ## Testing
 
-### Unit tests (no Docker needed)
+### Unit tests (white-box)
 
 ```bash
-pip install -e ".[dev]"
+python -m pip install -e ".[dev]"
 pytest tests/unit/ -v
 ```
 
-### Functional tests (requires PostgreSQL + Redis)
+### Functional tests (white-box, needs live PostgreSQL + Redis)
 
 ```bash
-# Option A: via Docker Compose (stack must be up)
-docker compose exec app pytest tests/functional/ -v
-
-# Option B: host-side with local Postgres/Redis
 DATABASE_URL=postgresql+asyncpg://leetcode:leetcode@localhost:5432/leetcode \
 REDIS_URL=redis://localhost:6379/0 \
 JWT_SECRET=test-secret \
