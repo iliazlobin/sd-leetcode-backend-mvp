@@ -16,7 +16,7 @@ COPY judge/ judge/
 # `--no-deps` previously skipped them, so `uvicorn` was absent from the venv and the
 # runtime CMD failed with `exec: "uvicorn": not found`. asyncpg kept explicit in case
 # it isn't a declared dependency.
-RUN pip install . && pip install asyncpg
+RUN pip install . && pip install asyncpg psycopg2-binary
 
 # Stage 2: Runtime
 FROM python:3.12-slim
