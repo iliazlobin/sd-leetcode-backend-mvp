@@ -1,0 +1,54 @@
+name: Functional Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "17 13 * * *"
+
+jobs:
+  functional:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: leetcode
+          POSTGRES_PASSWORD: leetcode
+          POSTGRES_DB: leetcode
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U leetcode"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: python -m pip install -e ".[dev]"
+      - name: Run migrations
+        env:
+          DATABASE_URL: postgresql+asyncpg://leetcode:leetcode@localhost:5432/leetcode
+        run: alembic upgrade head
+      - name: Functional tests
+        env:
+          DATABASE_URL: postgresql+asyncpg://leetcode:leetcode@localhost:5432/leetcode
+          REDIS_URL: redis://localhost:6379/0
+          JWT_SECRET: test-secret
+        run: pytest tests/functional/ -v
