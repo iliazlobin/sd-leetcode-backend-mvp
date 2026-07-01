@@ -30,8 +30,15 @@ jobs:
           python-version: "3.12"
       - name: Install docker compose
         run: |
-          sudo apt-get update
-          sudo apt-get install -y docker-compose-plugin
+          # GitHub Actions ubuntu-latest has docker daemon but compose plugin
+          # may be absent. Install standalone compose binary.
+          if ! docker compose version >/dev/null 2>&1; then
+            DOCKER_CONFIG="${DOCKER_CONFIG:-$HOME/.docker}"
+            mkdir -p "$DOCKER_CONFIG/cli-plugins"
+            curl -sSL "https://github.com/docker/compose/releases/download/v2.33.1/docker-compose-$(uname -s)-$(uname -m)" -o "$DOCKER_CONFIG/cli-plugins/docker-compose"
+            chmod +x "$DOCKER_CONFIG/cli-plugins/docker-compose"
+          fi
+          docker compose version
       - name: Source manifest and run e2e
         run: |
           set -euo pipefail
