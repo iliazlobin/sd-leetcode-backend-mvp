@@ -30,9 +30,10 @@ async def create_problem(
 ) -> Any:
     """Create a new coding problem (admin only)."""
     if body.difficulty not in VALID_DIFFICULTIES:
+        allowed = ", ".join(sorted(VALID_DIFFICULTIES))
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Invalid difficulty: {body.difficulty}. Must be one of: {', '.join(sorted(VALID_DIFFICULTIES))}",
+            detail=f"Invalid difficulty: {body.difficulty}. Must be one of: {allowed}",
         )
 
     test_cases = [
@@ -68,9 +69,10 @@ async def list_problems(
 ) -> Any:
     """List/search problems with pagination and optional filters."""
     if difficulty is not None and difficulty not in VALID_DIFFICULTIES:
+        allowed = ", ".join(sorted(VALID_DIFFICULTIES))
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Invalid difficulty: {difficulty}. Must be one of: {', '.join(sorted(VALID_DIFFICULTIES))}",
+            detail=f"Invalid difficulty: {difficulty}. Must be one of: {allowed}",
         )
 
     return await problem_service.list_problems(

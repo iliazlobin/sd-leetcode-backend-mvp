@@ -26,6 +26,7 @@ dev = [
     "pytest>=8.3,<9.0",
     "pytest-asyncio>=0.24,<1.0",
     "httpx>=0.28,<1.0",
+    "psycopg2-binary>=2.9,<3.0",
 ]
 
 [tool.pytest.ini_options]
@@ -41,6 +42,8 @@ ignore = ["B008"]  # B008: Depends()/Query() in defaults is standard FastAPI pat
 
 [tool.ruff.lint.per-file-ignores]
 "verify/acceptance/*" = ["B", "E501", "F841"]  # never edit acceptance cases
+"tests/functional/*" = ["E501"]  # test assertions are clearer on one line
+"tests/unit/*" = ["E501"]  # test assertions are clearer on one line
 "alembic/versions/*" = ["I"]  # alembic migrations have specific import order
 "scripts/*" = ["I"]  # seed script needs path setup before imports
 

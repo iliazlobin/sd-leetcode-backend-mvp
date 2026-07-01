@@ -13,22 +13,22 @@ async def lifespan(_app: FastAPI) -> Any:
     # Schema is managed by Alembic migrations (docker compose UP runs alembic upgrade head
     # before starting the app). create_all() is deliberately absent — it skips seed migrations.
     engine = _get_engine()
-    
+
     # Start judge worker as background task
     from judge.worker import run_judge_loop
     session_factory = _get_session_factory()
     redis_client = _get_redis()
     judge_task = asyncio.create_task(run_judge_loop(session_factory, redis_client))
-    
+
     yield
-    
+
     # Shutdown judge worker
     judge_task.cancel()
     try:
         await judge_task
     except asyncio.CancelledError:
         pass
-    
+
     await engine.dispose()
 
 

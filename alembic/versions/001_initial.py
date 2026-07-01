@@ -96,12 +96,8 @@ def upgrade() -> None:
         ),
         sa.Column("input_text", sa.Text(), nullable=False),
         sa.Column("expected_output", sa.Text(), nullable=False),
-        sa.Column(
-            "is_public", sa.Boolean(), nullable=False, server_default="false"
-        ),
-        sa.Column(
-            "order_index", sa.Integer(), nullable=False, server_default="0"
-        ),
+        sa.Column("is_public", sa.Boolean(), nullable=False, server_default="false"),
+        sa.Column("order_index", sa.Integer(), nullable=False, server_default="0"),
     )
 
     # --- submissions ---
@@ -127,9 +123,7 @@ def upgrade() -> None:
         ),
         sa.Column("language", sa.String(16), nullable=False),
         sa.Column("source_code", sa.Text(), nullable=False),
-        sa.Column(
-            "verdict", sa.String(32), nullable=False, server_default="Pending"
-        ),
+        sa.Column("verdict", sa.String(32), nullable=False, server_default="Pending"),
         sa.Column("runtime_ms", sa.Integer(), nullable=True),
         sa.Column("memory_kb", sa.Integer(), nullable=True),
         sa.Column(
@@ -142,9 +136,7 @@ def upgrade() -> None:
     )
     op.create_index("ix_submissions_user_id", "submissions", ["user_id"])
     op.create_index("ix_submissions_problem_id", "submissions", ["problem_id"])
-    op.create_index(
-        "ix_submissions_idempotency_key", "submissions", ["idempotency_key"]
-    )
+    op.create_index("ix_submissions_idempotency_key", "submissions", ["idempotency_key"])
     op.create_index(
         "ix_submissions_user_submitted",
         "submissions",

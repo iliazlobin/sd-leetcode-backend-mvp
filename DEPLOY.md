@@ -52,21 +52,37 @@ See `.env.example` for the full list. Key variables:
 |----------------|------------------------------------------------------------|----------------------------|
 | `DATABASE_URL` | `postgresql+asyncpg://leetcode:leetcode@db:5432/leetcode`  | Async PG connection        |
 | `REDIS_URL`    | `redis://redis:6379/0`                                     | Redis connection           |
-| `JWT_SECRET`   | `change-me-in-production`                                  | JWT signing key            |
+| `JWT_SECRET`   | `change-me-to-a-random-secret`                             | JWT signing key            |
 | `APP_PORT`     | `8010`                                                     | Host port for the API      |
+
+## Running Migrations
+
+```bash
+docker compose exec app alembic upgrade head
+```
+
+## Seeding Data
+
+```bash
+docker compose exec app python scripts/seed.py
+```
 
 ## Testing
 
-### Unit tests (white-box)
+### Unit tests (no Docker needed)
 
 ```bash
-python -m pip install -e ".[dev]"
+pip install -e ".[dev]"
 pytest tests/unit/ -v
 ```
 
-### Functional tests (white-box, needs live PostgreSQL + Redis)
+### Functional tests (requires PostgreSQL + Redis)
 
 ```bash
+# Option A: via Docker Compose (stack must be up)
+docker compose exec app pytest tests/functional/ -v
+
+# Option B: host-side with local Postgres/Redis
 DATABASE_URL=postgresql+asyncpg://leetcode:leetcode@localhost:5432/leetcode \
 REDIS_URL=redis://localhost:6379/0 \
 JWT_SECRET=test-secret \
