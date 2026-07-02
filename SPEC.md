@@ -43,7 +43,7 @@ working backend API with judge capability, deployable via Docker Compose.
 - **Tests:** pytest, httpx (ASGI transport for functional tests)
 - **Deploy:** Docker Compose — `db` + `redis` + `app` + `judge-worker` services
 - **Port:** `app` publishes `${APP_PORT:-8010}:8000`; other services internal
-- **Design →** [System Design: LeetCode](https://app.notion.com/p/iliazlobin/38fd865005a881538614e0b53039e116)
+- **Design →** [DESIGN.md](DESIGN.md)
 
 ## 4. Data model
 

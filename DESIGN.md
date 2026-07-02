@@ -1,9 +1,23 @@
-# LeetCode MVP — Architecture Design
+# LeetCode Backend MVP — Design
 
-> Adapts the full [System Design: LeetCode](docs/system-design.md) to the MVP scope defined in
-> [docs/mvp-scope.md](docs/mvp-scope.md). This document is the concrete build contract —
-> it specifies every entity, endpoint, and service decision the implementation must follow.
-> It contains zero app code; the acceptance suite in `verify/acceptance/` enforces the FRs.
+A minimal online code-judge platform backend: users browse coding problems, submit Python
+solutions, and receive automated verdicts from a background judge that executes their code
+against stored test cases. This document describes the architecture, data model, API, and
+key design decisions of this build, and maps every functional requirement to the test that
+proves it.
+
+The MVP is deliberately scoped down from a full-scale LeetCode-style system design (Kafka
+judge queue, Firecracker microVM sandboxes, 20+ languages, contests, real-time WebSocket
+updates, S3 test-case storage). This build keeps the same core flow — problem CRUD → submit
+→ judge → verdict → leaderboard — on a smaller, operationally simple stack: FastAPI,
+PostgreSQL 16, Redis 7, and a subprocess-based judge.
+
+**In scope:** problem CRUD (create/list/search/get), code submission with background judging
+(Python only), submission history, a global leaderboard ranked by distinct problems solved,
+JWT authentication, and Docker Compose deployment.
+
+**Out of scope (future phases):** multi-language support, contests, WebSocket updates,
+microVM isolation, user self-registration (users are seeded via migration), and a frontend.
 
 ## 1. Architecture Overview
 
@@ -29,7 +43,7 @@ graph TB
         RD[(Redis<br/>leaderboard cache)]
     end
 
-    subgraph judge["Judge Worker — separate process"]
+    subgraph judge["Judge Worker — background task"]
         JW[JudgeWorker<br/>polling loop]
         SB[Sandbox<br/>subprocess<br/>timeout=5s]
     end
@@ -57,13 +71,23 @@ graph TB
     class JW,SB rt
 ```
 
-**Layers:** Router (HTTP parse/validate/serialize, no business logic) → Service (business logic + data access) → Model (ORM, DB session). This is the standard FastAPI three-layer split from `SYSTEM-DESIGN-MVP-STANDARDS.md`.
+**Layers:** Router (HTTP parse/validate/serialize, no business logic) → Service (business
+logic + data access) → Model (ORM, DB session). The standard FastAPI three-layer split.
 
-**Judge worker** is a separate process that shares the PostgreSQL database with the API. It polls `submissions` for `verdict='Pending'`, executes user code in a sandboxed subprocess with a 5-second timeout, and writes the verdict back. The acceptance tests expect the judge to be running alongside the API.
+**Judge worker** lives in the `judge/` package and runs as an asyncio background task
+started by the app's lifespan (it can also run standalone via `python -m judge.runner`).
+It polls `submissions` for `verdict='Pending'`, executes user code in a sandboxed
+subprocess with a 5-second timeout, and writes the verdict back to the shared PostgreSQL
+database.
 
-**No Kafka, no Firecracker, no multi-language support, no WebSocket** — those are out of MVP scope per `docs/mvp-scope.md`. This MVP implements: problem CRUD → submit code → judge execution → poll verdict → submission history → leaderboard.
+**No Kafka, no Firecracker, no multi-language support, no WebSocket** — those belong to
+the full-scale design, not the MVP. The MVP implements: problem CRUD → submit code →
+judge execution → poll verdict → submission history → leaderboard.
 
-**Redis** serves one purpose in the MVP: caching the leaderboard (TTL 30s) to avoid a full GROUP BY scan on every poll. The full design's Redis ZSET leaderboard is the future path; MVP uses a simple cache-aside pattern.
+**Redis** serves two purposes: caching the leaderboard (TTL 30s) to avoid a full GROUP BY
+scan on every poll, and a fast idempotency check for duplicate submissions. The full
+design's Redis ZSET leaderboard is the future path; the MVP uses a simple cache-aside
+pattern.
 
 ## 2. Data Model (SQLAlchemy ORM)
 
@@ -123,7 +147,8 @@ class Submission(Base):
     language:      Mapped[str]        = Column(String(16), nullable=False)  # "python3"
     source_code:   Mapped[str]        = Column(Text, nullable=False)
     verdict:       Mapped[str]        = Column(String(32), nullable=False, default="Pending")
-                                        # ← "Pending" | "Running" | "Accepted" | "Wrong Answer" | "TLE" | "RE" | "CE"
+                                        # ← "Pending" | "Running" | "Accepted" | "Wrong Answer"
+                                        #   | "Time Limit Exceeded" | "Runtime Error"
     runtime_ms:    Mapped[int | None] = Column(Integer, nullable=True)
     memory_kb:     Mapped[int | None] = Column(Integer, nullable=True)
     submitted_at:  Mapped[datetime]   = Column(DateTime(timezone=True), server_default=func.now())
@@ -139,7 +164,7 @@ class Submission(Base):
 | `idempotency_key` on Submission | Detects duplicate submissions within a 30-second window. Computed as `SHA256(user_id + problem_id + source_code)` on insert. The API checks for an existing row with the same key and `submitted_at > now() - 30s`; if found, returns 409 Conflict. |
 | `TestCase.is_public` boolean | Separation of public (visible in problem view) and hidden test cases. The judge runs ALL test cases; `GET /problems/{id}` returns only `is_public=true` entries. |
 | `TestCase.order_index` | Guarantees deterministic execution order. The judge runs test cases ascending by `order_index`. |
-| `verdict` as a string enum on Submission | The submission row IS the queue entry — no separate `judge_queue` table. The judge worker polls `SELECT ... WHERE verdict = 'Pending' ORDER BY submitted_at LIMIT 1 FOR UPDATE SKIP LOCKED`. This is the MVP's PostgreSQL-backed queue (replaces Kafka from the full design). |
+| `verdict` as a string enum on Submission | The submission row IS the queue entry — no separate `judge_queue` table. The judge worker polls `SELECT ... WHERE verdict = 'Pending' ORDER BY submitted_at LIMIT 1 FOR UPDATE SKIP LOCKED`. This is the MVP's PostgreSQL-backed queue (in place of a dedicated message broker). |
 | GIN index on `problems.tags` | Enables efficient `@>` (array-contains) queries for tag filtering: `WHERE tags @> ARRAY['dp']`. |
 | No `LeaderboardEntry` table | The MVP leaderboard is computed on the fly from the `submissions` table: `SELECT user_id, COUNT(DISTINCT problem_id) ... WHERE verdict = 'Accepted' GROUP BY user_id`. Cached in Redis for 30 seconds. A materialized view or denormalized table is a future optimization. |
 | `code_stub` on Problem | The Python function template the client renders in the editor. The judge prepends this stub to the user's source code before execution. |
@@ -153,7 +178,9 @@ class Submission(Base):
 
 ## 3. API Contracts
 
-All endpoints are mounted on the FastAPI app. Request/response bodies are JSON. Authentication is via JWT Bearer token (except `/healthz` and `/auth/token`).
+All endpoints are mounted on the FastAPI app. Request/response bodies are JSON.
+Authentication is via JWT Bearer token (except `/healthz`, `/auth/token`, and
+`/leaderboard`).
 
 ### 3.1 Health
 
@@ -164,7 +191,7 @@ Response 200:
   {"status": "ok"}
 ```
 
-Used by compose healthcheck. No auth required.
+Used by the compose healthcheck. No auth required.
 
 ### 3.2 Authentication (supporting)
 
@@ -189,7 +216,8 @@ Errors:
   401 — invalid username or password
 ```
 
-**Supporting endpoint** — not an FR, used by acceptance tests to obtain auth tokens. Users are pre-seeded via Alembic migration (admin + regular users).
+**Supporting endpoint** — not an FR of its own; every authenticated flow obtains its
+token here. Users are pre-seeded via Alembic migration (admin + regular users).
 
 ### 3.3 Problems (FR-1, FR-2, FR-3)
 
@@ -342,7 +370,8 @@ Response 200:
     "problem_id":    "uuid",
     "user_id":       "uuid",
     "language":      str,
-    "verdict":       "Pending" | "Running" | "Accepted" | "Wrong Answer" | "TLE" | "RE" | "CE",
+    "verdict":       "Pending" | "Running" | "Accepted" | "Wrong Answer"
+                     | "Time Limit Exceeded" | "Runtime Error",
     "runtime_ms":    int | null,         // populated when verdict is final
     "memory_kb":     int | null,         // populated when verdict is final
     "source_code":   str,
@@ -393,7 +422,7 @@ Errors:
 
 ### 3.5 Leaderboard (FR-8)
 
-`GET /leaderboard` — Global leaderboard ranked by distinct problems solved. Public (no auth required per FR-8 spec; auth not mentioned in AC-8).
+`GET /leaderboard` — Global leaderboard ranked by distinct problems solved. Public (no auth required).
 
 ```
 Query params:
@@ -473,7 +502,10 @@ list_submissions(db, user_id, problem_id, page, limit) → (items, total)
 
 ### Judge Worker (`services/judge_service.py` and `judge/worker.py`)
 
-The judge worker runs as a separate process that shares the database. It is NOT mounted as a FastAPI route — it is an independent polling loop.
+The judge worker logic lives in the `judge/` package. In the shipped configuration it runs
+as an asyncio background task started by the FastAPI app's lifespan, sharing the database;
+it can also run as a standalone process via `python -m judge.runner`. It is not a FastAPI
+route — it is an independent polling loop.
 
 ```
 run_judge_loop(db_session_factory, poll_interval=0.5) → runs forever
@@ -489,8 +521,8 @@ run_judge_loop(db_session_factory, poll_interval=0.5) → runs forever
        └─ SELECT test_cases WHERE problem_id = ? ORDER BY order_index.
        └─ For each test_case:
             └─ Execute source_code in sandbox subprocess (see §4.1).
-            └─ If sandbox raises TimeoutError → verdict = 'TLE', break.
-            └─ If sandbox raises RuntimeError → verdict = 'RE', break.
+            └─ If sandbox raises TimeoutError → verdict = 'Time Limit Exceeded', break.
+            └─ If sandbox raises RuntimeError → verdict = 'Runtime Error', break.
             └─ Strip stdout, compare with test_case.expected_output.
             └─ If mismatch → verdict = 'Wrong Answer', break.
        └─ If all passed → verdict = 'Accepted'.
@@ -500,7 +532,7 @@ run_judge_loop(db_session_factory, poll_interval=0.5) → runs forever
 
 reprocess_submission(db, submission_id) → no-op if already final
   └─ SELECT verdict WHERE submission_id = ?.
-  └─ If verdict is final (Accepted/WA/TLE/RE) → skip (idempotent).
+  └─ If verdict is final (Accepted/Wrong Answer/TLE/RE) → skip (idempotent).
   └─ Otherwise proceed with judging.
 ```
 
@@ -515,12 +547,11 @@ execute_code(source_code, input_text, timeout_seconds=5) → (stdout, stderr, ru
   └─ If timeout → raise TimeoutError.
   └─ If non-zero exit → raise RuntimeError(stderr).
   └─ Return (stdout, stderr, runtime_ms, memory_kb).
-
-**Production path:** The subprocess approach is for development/testing. In Docker Compose,
-the judge worker runs code inside a Docker container with cgroups (256 MB memory, 5s CPU cap,
-no network). The `judge/sandbox.py` `execute_code` function abstracts the execution backend
-— swap subprocess for Docker SDK in production with the same interface.
 ```
+
+The `execute_code` interface abstracts the execution backend: the MVP ships a subprocess
+executor with a hard 5-second timeout; a container-based sandbox (cgroups memory/CPU caps,
+no network) is the production hardening path and slots in behind the same interface.
 
 ### LeaderboardService (`services/leaderboard_service.py`)
 
@@ -567,21 +598,21 @@ require_admin(user) → None
 
 **Pro (chosen):** Single source of truth — the submission row IS the queue entry. No dual-write risk (insert submission + push to queue). No queue/schema drift. The verdict, runtime, and memory are updated in-place with one transaction. Operational simplicity — one database to back up, monitor, and restore.
 
-**Con (chosen):** Polling overhead — the judge worker wakes every 0.5 seconds even when idle. At 200 submissions/sec (full design ceiling), a DB-backed queue would hit contention on the index. Acceptable for MVP: the polling overhead is negligible at MVP traffic (tens of submissions per minute).
+**Con (chosen):** Polling overhead — the judge worker wakes every 0.5 seconds even when idle. At hundreds of submissions/sec (the full-scale design's ceiling), a DB-backed queue would hit contention on the index. Acceptable for MVP: the polling overhead is negligible at MVP traffic (tens of submissions per minute).
 
-**Rationale:** The full design's Kafka queue solves the throughput problem at 200+ submissions/sec with consumer groups and replay. MVP has no such load — a single DB-backed polling worker is simpler. The `SKIP LOCKED` clause (Postgres 9.5+) allows multiple judge workers if needed, and the polling interval keeps idle CPU near zero.
+**Rationale:** A dedicated message queue (Kafka in the full-scale design) solves the throughput problem at 200+ submissions/sec with consumer groups and replay. The MVP has no such load — a single DB-backed polling worker is simpler. The `SKIP LOCKED` clause (Postgres 9.5+) allows multiple judge workers if needed, and the polling interval keeps idle CPU near zero.
 
 ### D2: Sandbox isolation — subprocess vs. Docker container vs. Firecracker
 
 **Chosen (MVP):** Subprocess with timeout — `subprocess.run(timeout=5)`.
 
-**Alternative (production):** Docker container with cgroups (256MB memory, no network, CPU limit). The full design uses Firecracker microVMs for kernel-level isolation.
+**Alternative (production):** Docker container with cgroups (256MB memory, no network, CPU limit). The full-scale design uses Firecracker microVMs for kernel-level isolation.
 
-**Pro (chosen):** Zero infrastructure. Works without Docker daemon, kernel modules, or root. Fastest startup (no container/image pull). Directly runnable in the sandbox for dev/testing. Deterministic timeout via `subprocess.run(timeout=5)` — the O/S kills the process group on timeout.
+**Pro (chosen):** Zero infrastructure. Works without Docker daemon, kernel modules, or root. Fastest startup (no container/image pull). Deterministic timeout via `subprocess.run(timeout=5)` — the OS kills the process group on timeout.
 
-**Con (chosen):** No isolation. Malicious code can read filesystem, exhaust file descriptors, or fork-bomb. These risks are acceptable for an MVP with seeded admin users and no public registration. The `judge/sandbox.py` interface (`execute_code(source_code, input_text, timeout)`) abstracts the backend — swap to Docker SDK in production without changing the judge worker.
+**Con (chosen):** No isolation. Malicious code can read the filesystem, exhaust file descriptors, or fork-bomb. These risks are acceptable for an MVP with seeded admin users and no public registration. The `judge/sandbox.py` interface (`execute_code(source_code, input_text, timeout)`) abstracts the backend — swap to a container-based executor in production without changing the judge worker.
 
-**Rationale:** The acceptance suite needs the judge to run in the same process tree as the API (for sandbox CI testing). A subprocess approach satisfies all FR-6 acceptance criteria (timeout, error capture, stdout comparison) without requiring Docker in CI.
+**Rationale:** A subprocess sandbox satisfies every FR-6 behavior (timeout, error capture, stdout comparison) and runs anywhere Python runs — including CI runners without Docker-in-Docker. The isolation upgrade path is an executor swap, not a redesign.
 
 ### D3: Leaderboard — computed query vs. materialized view vs. Redis ZSET
 
@@ -589,13 +620,13 @@ require_admin(user) → None
 
 **Alternative 1:** PostgreSQL materialized view (`CREATE MATERIALIZED VIEW leaderboard AS SELECT ...`). Refresh on schedule (`REFRESH MATERIALIZED VIEW CONCURRENTLY`). No cache layer needed.
 
-**Alternative 2:** Redis ZSET (the full design's approach). Judge worker calls `ZADD leaderboard <score> <user_id>` on every Accepted verdict. Client reads `ZREVRANGE` with `WITHSCORES`. True real-time, O(log N) writes, O(log N + M) reads.
+**Alternative 2:** Redis ZSET (the full-scale design's approach). Judge worker calls `ZADD leaderboard <score> <user_id>` on every Accepted verdict. Client reads `ZREVRANGE` with `WITHSCORES`. True real-time, O(log N) writes, O(log N + M) reads.
 
-**Pro (chosen):** Simplest to implement and reason about. The 30s cache means the leaderboard is at most 30 seconds stale — acceptable for MVP REST polling (the full design uses WebSocket for real-time). The SQL approach correctly handles tie-breaking (problems_solved DESC, last_solved_at ASC) with a single `ORDER BY`.
+**Pro (chosen):** Simplest to implement and reason about. The 30s cache means the leaderboard is at most 30 seconds stale — acceptable for REST polling (real-time push is a future phase). The SQL approach correctly handles tie-breaking (problems_solved DESC, last_solved_at ASC) with a single `ORDER BY`.
 
 **Con (chosen):** Cache invalidation on every Accepted verdict means the next poll rebuilds the full leaderboard with a GROUP BY + JOIN across all submissions. At MVP scale (thousands of submissions, not millions), this is sub-100ms. The 30s TTL also means concurrent Accepted verdicts within a 30s window may show inconsistent rankings until the cache expires.
 
-**Rationale:** The full design's Redis ZSET approach is better for contest-scale traffic (100K users, real-time WebSocket pushes) but overengineered for MVP. The cache-aside pattern with a 30s TTL is the smallest increment that works. When the cache is cold, the query runs fresh; when hot, reads are sub-1ms.
+**Rationale:** The Redis ZSET approach is better for contest-scale traffic (100K users, real-time pushes) but overengineered for MVP. The cache-aside pattern with a 30s TTL is the smallest increment that works. When the cache is cold, the query runs fresh; when hot, reads are sub-1ms.
 
 ### D4: Submission idempotency — 30s window vs. hash-only vs. DB UNIQUE constraint
 
@@ -607,7 +638,7 @@ require_admin(user) → None
 
 **Con (chosen):** Two sources of truth. If Redis is flushed, the idempotency check falls back to the DB query (slightly slower but correct). The 30s TTL means identical code resubmitted after 31 seconds creates a new submission — by design, not a bug.
 
-**Rationale:** LeetCode's production system does exactly this — a short-lived dedup window. Permanent dedup (the alternative) would block a user from ever resubmitting code they wrote days ago, which is hostile UX.
+**Rationale:** A short-lived dedup window matches how production judges behave. Permanent dedup (the alternative) would block a user from ever resubmitting code they wrote days ago, which is hostile UX.
 
 ### D5: Users — seed data vs. registration endpoint
 
@@ -615,77 +646,70 @@ require_admin(user) → None
 
 **Alternative:** Full registration endpoint `POST /users` with self-service signup. More complete, no pre-seeding required.
 
-**Pro (chosen):** User registration is explicitly out of MVP scope per `docs/mvp-scope.md`. Pre-seeding keeps the scope tight — the database migration creates admin + regular users with known passwords. The login endpoint provides the JWT token the acceptance tests need.
+**Pro (chosen):** User registration is explicitly out of MVP scope. Pre-seeding keeps the scope tight — the database migration creates admin + regular users with known passwords. The login endpoint issues the JWT tokens every authenticated flow needs.
 
 **Con (chosen):** Hardcoded seed data is not portable across environments. Adding a new test user requires a migration or seed script. Acceptable for MVP — the seed data is the single source of truth for the demo environment.
 
-**Rationale:** Every acceptance test needs an auth token. Rather than making user registration an untested dependency, the seed migration creates users with deterministic credentials. The acceptance suite reads these credentials from environment variables (`TEST_ADMIN_USERNAME`, `TEST_USER_PASSWORD`, etc.) and obtains tokens via `POST /auth/token`.
+**Rationale:** Every authenticated flow needs a token. Rather than making user registration an untested dependency, the seed migration creates users with deterministic credentials; the acceptance suite reads these credentials from environment variables (`TEST_ADMIN_USERNAME`, `TEST_USER_PASSWORD`, etc.) and obtains tokens via `POST /auth/token`.
 
-## 6. Module Layout (implementation-ready)
+## 6. Module Layout
 
 ```
 src/leetcode/                ← package name: leetcode (importable as leetcode.*)
 ├── __init__.py
-├── main.py                 # create_app() factory + lifespan + /healthz + mount routers
-├── config.py               # pydantic-settings: DATABASE_URL, REDIS_URL, JWT_SECRET
-├── database.py             # SQLAlchemy async engine, get_session dependency
-├── auth.py                 # JWT encode/decode, get_current_user dependency, require_admin
-├── models/
-│   ├── __init__.py
-│   ├── user.py             # User ORM model
-│   ├── problem.py          # Problem ORM model
-│   ├── test_case.py        # TestCase ORM model
-│   └── submission.py       # Submission ORM model
-├── schemas/
-│   ├── __init__.py
-│   ├── auth.py             # TokenRequest, TokenResponse
-│   ├── problem.py          # CreateProblemRequest, ProblemResponse, ProblemListItem
-│   ├── submission.py       # CreateSubmissionRequest, SubmissionResponse, SubmissionListItem
-│   └── leaderboard.py      # LeaderboardEntry, LeaderboardResponse
-├── routers/
-│   ├── __init__.py
-│   ├── auth.py             # POST /auth/token
-│   ├── problems.py         # POST /problems, GET /problems, GET /problems/{id}
-│   ├── submissions.py      # POST /submissions, GET /submissions/{id}, GET /submissions
-│   └── leaderboard.py      # GET /leaderboard
-└── services/
-    ├── __init__.py
-    ├── auth_service.py     # authenticate_user, create_token, get_current_user
-    ├── problem_service.py  # create_problem, list_problems, get_problem
-    ├── submission_service.py  # create_submission, get_submission, list_submissions
-    ├── judge_service.py    # run_judge_loop, execute_and_verify (orchestration)
-    └── leaderboard_service.py  # get_leaderboard, invalidate_cache
+├── main.py                  # create_app() factory + lifespan (starts judge task) + routers
+├── config.py                # pydantic-settings: DATABASE_URL, REDIS_URL, JWT_SECRET
+├── database.py              # SQLAlchemy async engine, get_session dependency
+├── auth.py                  # JWT encode/decode, get_current_user dependency, require_admin
+├── models/                  # SQLAlchemy ORM models
+│   ├── user.py              # User
+│   ├── problem.py           # Problem
+│   ├── test_case.py         # TestCase
+│   └── submission.py        # Submission
+├── schemas/                 # Pydantic request/response DTOs
+│   ├── auth.py              # TokenRequest, TokenResponse
+│   ├── problem.py           # CreateProblemRequest, ProblemResponse, ProblemListItem
+│   ├── submission.py        # CreateSubmissionRequest, SubmissionResponse, SubmissionListItem
+│   └── leaderboard.py       # LeaderboardEntry, LeaderboardResponse
+├── routers/                 # Thin HTTP layer
+│   ├── auth.py              # POST /auth/token
+│   ├── health.py            # GET /healthz
+│   ├── problems.py          # POST /problems, GET /problems, GET /problems/{id}
+│   ├── submissions.py       # POST /submissions, GET /submissions/{id}, GET /submissions
+│   └── leaderboard.py       # GET /leaderboard
+└── services/                # Business logic
+    ├── auth_service.py      # authenticate_user, create_token, get_current_user
+    ├── problem_service.py   # create_problem, list_problems, get_problem
+    ├── submission_service.py # create_submission, get_submission, list_submissions
+    ├── judge_service.py     # judging orchestration
+    └── leaderboard_service.py # get_leaderboard, invalidate_cache
 
-judge/                       ← judge worker — separate process, shares DB
-├── __init__.py
-├── runner.py               # Entry point: python -m judge.runner (polling loop + sandbox)
-├── worker.py               # Polling loop: claim → execute → update verdict
-└── sandbox.py              # execute_code(source_code, input_text, timeout) → (stdout, err, ms, kb)
+judge/                       ← judge worker package (asyncio task in-app, or standalone)
+├── runner.py                # Standalone entry point: python -m judge.runner
+├── worker.py                # Polling loop: claim → execute → update verdict
+└── sandbox.py               # execute_code(source_code, input_text, timeout) → (stdout, err, ms, kb)
 
 alembic/
-├── env.py
-├── versions/
-│   └── 001_initial.py      # Creates users (with seed data), problems, test_cases, submissions
-│   └── 002_seed_users.py   # Seed admin + regular users with known passwords
+└── versions/
+    ├── 001_initial.py       # Creates users, problems, test_cases, submissions
+    └── 002_seed_users.py    # Seeds admin + regular users with known passwords
 
 tests/
 ├── conftest.py
-├── unit/
+├── test_health.py           # /healthz liveness
+├── unit/                    # White-box service-layer tests
+│   ├── test_auth_service.py
 │   ├── test_problem_service.py
-│   ├── test_submission_service.py
-│   ├── test_judge_service.py
-│   ├── test_leaderboard_service.py
-│   └── test_auth_service.py
-└── functional/
+│   └── test_submission_service.py
+└── functional/              # In-process integration tests (httpx ASGITransport)
     ├── conftest.py
     ├── test_problems.py
     ├── test_submissions.py
     └── test_leaderboard.py
 
 verify/
-├── manifest.env            # e2e-verify configuration (filled by SRE)
-└── acceptance/             # Black-box HTTP contract (one per FR)
-    ├── __init__.py
+├── manifest.env             # e2e verification configuration
+└── acceptance/              # Black-box HTTP acceptance suite (one file per FR)
     ├── conftest.py
     ├── test_fr1_create_problem.py
     ├── test_fr2_list_problems.py
@@ -696,105 +720,108 @@ verify/
     ├── test_fr7_submission_history.py
     └── test_fr8_leaderboard.py
 
-docs/
-├── system-design.md        # Full target design (from system-designs)
-├── mvp-scope.md            # MVP contract (from build kickoff)
-└── synthesis.md            # Writer's evidence-backed summary (added later)
-
-design.md                   # This file
-AGENTS.md                   # Agent workspace rules
-KICKOFF.md                  # How to launch the build loop
-README.md                   # What it is, stack, quick start, API table
-DEPLOY.md                   # Host run/teardown steps
-.gitignore
-.env.example
-pyproject.toml
+DESIGN.md                    # This file
+README.md                    # What it is, stack, quick start, API table
+SPEC.md                      # Engineering spec
+DEPLOY.md                    # Host run/teardown steps
 Dockerfile
-docker-compose.yml
+docker-compose.yml           # db + redis + app
+pyproject.toml
+.env.example
+.github/workflows/           # lint.yml + ci.yml + functional.yml (see §9)
 ```
 
-### Tier assignments for implementation (per the kanban build plan)
+## 7. Functional Requirements → Acceptance Tests
 
-| Task | Tier | Rationale |
-|------|------|-----------|
-| `models/*.py` (4 ORM models) | **staff** | Data model + migrations are load-bearing; wrong schema = broken system |
-| `alembic/` migration (001_initial + 002_seed) | **staff** | Schema DDL must match models exactly; seed data must produce valid auth tokens |
-| `services/submission_service.py` (create, dedup, idempotency) | **staff** | Core business logic: idempotency key computation, Redis cache interaction, 30s window dedup check |
-| `services/judge_service.py` (orchestration) | **staff** | Correctness-critical: fail-fast logic, verdict transitions, atomic claim-and-update with SKIP LOCKED |
-| `judge/worker.py` (polling loop) | **staff** | Concurrency-sensitive: FOR UPDATE SKIP LOCKED, transaction boundaries, idempotent reprocessing |
-| `judge/sandbox.py` (code execution) | **staff** | Security boundary: subprocess isolation, timeout enforcement, stdout capture, error classification |
-| `services/leaderboard_service.py` | **staff** | Core algorithm: GROUP BY + ORDER BY tie-breaking, Redis cache invalidation on verdict update |
-| `services/auth_service.py` | **staff** | Security-sensitive: JWT signing/verification, password hashing, role-based access |
-| `services/problem_service.py` | **senior** | CRUD with uniqueness check, array-contains filtering |
-| `routers/*.py` (all 4) | **senior** | Thin HTTP glue: parse Pydantic, call service, serialize response |
-| `schemas/*.py` (all 4) | **senior** | Pydantic DTOs: field validation, serialization config |
-| `config.py` | **senior** | pydantic-settings boilerplate |
-| `database.py` | **senior** | Engine + session factory |
-| `main.py` | **senior** | App factory + lifespan + healthz + router mounting |
-| `auth.py` (dependency callables) | **senior** | FastAPI dependencies: get_current_user, require_admin |
-| `tests/unit/` | **senior** | Standard unit test scaffolding |
-| `tests/functional/` | **senior** | ASGITransport integration tests |
-| `Dockerfile` | **sre** | Multi-stage build |
-| `docker-compose.yml` | **sre** | Service orchestration (db + redis + app + judge) |
-| `.env.example` | **senior** | Documentation |
-| `pyproject.toml` | **senior** | Dependency manifest |
+Each FR maps to exactly one black-box acceptance test file in `verify/acceptance/`. The
+suite runs over HTTP against the live, fully-migrated stack (API + judge + PostgreSQL +
+Redis) and proves the externally observable contract.
 
-## 7. Acceptance Criteria (build-gate checklist)
+| # | FR | Acceptance test | What it proves |
+|---|----|-----------------|----------------|
+| 1 | Create problem | `verify/acceptance/test_fr1_create_problem.py` | POST /problems → 201 with problem; missing title → 422; duplicate title → 409; unauthenticated → 401; non-admin → 403 |
+| 2 | List/search problems | `verify/acceptance/test_fr2_list_problems.py` | GET /problems → 200 paginated; difficulty filter works; tag filter works; invalid difficulty → 422 |
+| 3 | Get problem | `verify/acceptance/test_fr3_get_problem.py` | GET /problems/{id} → 200 with public test cases only; unknown ID → 404 |
+| 4 | Submit solution | `verify/acceptance/test_fr4_submit_solution.py` | POST /submissions → 201 Pending; unsupported language → 422; unknown problem → 404; missing fields → 422; unauthenticated → 401 |
+| 5 | Get verdict | `verify/acceptance/test_fr5_get_verdict.py` | GET /submissions/{id} → 200 with verdict + runtime/memory; cross-user → 403; unknown ID → 404 |
+| 6 | Judge execution | `verify/acceptance/test_fr6_judge_execution.py` | Correct code → Accepted; wrong output → Wrong Answer; infinite loop → Time Limit Exceeded (5s); syntax error → Runtime Error; re-processing a judged submission is a no-op |
+| 7 | Submission history | `verify/acceptance/test_fr7_submission_history.py` | GET /submissions?problem_id={id} → 200 paginated, most-recent-first, scoped to the requesting user; unauthenticated → 401; empty history → 200 [] |
+| 8 | Leaderboard | `verify/acceptance/test_fr8_leaderboard.py` | GET /leaderboard → 200 ranked by problems_solved DESC; tie-break by earlier last-accepted timestamp; pagination works |
 
-Each FR maps to exactly one black-box acceptance test in `verify/acceptance/`. All eight must pass against the running system for the build to ship.
-
-| # | FR | Test file | What it proves |
-|---|----|-----------|----------------|
-| 1 | Create problem | `test_fr1_create_problem.py` | POST /problems → 201 with problem; missing title → 422; duplicate title → 409; unauthenticated → 401; non-admin → 403 |
-| 2 | List problems | `test_fr2_list_problems.py` | GET /problems → 200 paginated; difficulty filter works; tag filter works; invalid difficulty → 422 |
-| 3 | Get problem | `test_fr3_get_problem.py` | GET /problems/{id} → 200 with public test cases; unknown ID → 404 |
-| 4 | Submit solution | `test_fr4_submit_solution.py` | POST /submissions → 201 Pending; unsupported language → 422; unknown problem → 404; missing fields → 422; unauth → 401 |
-| 5 | Get verdict | `test_fr5_get_verdict.py` | GET /submissions/{id} → 200 with verdict; cross-user → 403; unknown ID → 404 |
-| 6 | Judge execution | `test_fr6_judge_execution.py` | Correct code → Accepted; wrong output → WA; infinite loop → TLE; syntax error → RE; reprocessing is idempotent |
-| 7 | Submission history | `test_fr7_submission_history.py` | GET /submissions?problem_id={id} → 200 paginated by user; unauth → 401; empty history → 200 [] |
-| 8 | Leaderboard | `test_fr8_leaderboard.py` | GET /leaderboard → 200 ranked by problems_solved; tie-break by timestamp; pagination works |
-
-## 8. Run & Test
-
-```bash
-# Start the stack (host-only, requires Docker)
-docker compose up -d
-
-# Run migrations + seed data
-docker compose run app alembic upgrade head
-
-# Start judge worker
-docker compose run judge python -m judge.runner &
-
-# Verify health
-curl http://localhost:${APP_PORT:-8010}/healthz
-
-# Obtain admin token (for acceptance tests)
-curl -X POST http://localhost:${APP_PORT:-8010}/auth/token \
-  -H "Content-Type: application/json" \
-  -d '{"username":"admin","password":"admin123"}'
-
-# Run white-box tests (in sandbox)
-pip install -e ".[dev]"
-pytest tests/unit/ tests/functional/ -v
-
-# Run black-box acceptance (against running system, judge worker must be running)
-API_BASE_URL=http://localhost:${APP_PORT:-8010} \
-TEST_ADMIN_USERNAME=admin \
-TEST_ADMIN_PASSWORD=admin123 \
-TEST_USER_USERNAME=alice \
-TEST_USER_PASSWORD=alice123 \
-pytest verify/acceptance/ -v
-```
-
-### Environment variables for acceptance tests
+The acceptance suite reads its target and credentials from the environment:
 
 | Variable | Purpose | Used by |
 |----------|---------|---------|
 | `API_BASE_URL` | Base URL of the running API | All tests |
-| `TEST_ADMIN_USERNAME` | Admin username (from seed data) | FR-1, FR-2, FR-3 |
-| `TEST_ADMIN_PASSWORD` | Admin password (from seed data) | FR-1, FR-2, FR-3 |
-| `TEST_USER_USERNAME` | Regular user username (from seed data) | FR-4, FR-5, FR-7 |
-| `TEST_USER_PASSWORD` | Regular user password (from seed data) | FR-4, FR-5, FR-7 |
-| `TEST_USER2_USERNAME` | Second regular user (from seed data) | FR-5 (cross-user isolation), FR-8 |
-| `TEST_USER2_PASSWORD` | Second regular user password (from seed data) | FR-5, FR-8 |
+| `TEST_ADMIN_USERNAME` / `TEST_ADMIN_PASSWORD` | Admin credentials (from seed data) | FR-1, FR-2, FR-3 |
+| `TEST_USER_USERNAME` / `TEST_USER_PASSWORD` | Regular user credentials (from seed data) | FR-4, FR-5, FR-7 |
+| `TEST_USER2_USERNAME` / `TEST_USER2_PASSWORD` | Second user (cross-user isolation, ranking) | FR-5, FR-8 |
+| `TEST_USER3_USERNAME` / `TEST_USER3_PASSWORD` | Third user (leaderboard ranking) | FR-8 |
+
+## 8. Test Scenarios
+
+Beyond the per-FR acceptance contract, the important cross-cutting behaviors are pinned
+by the in-process functional suite in `tests/functional/` (httpx `ASGITransport` against
+the real app wired to real PostgreSQL + Redis):
+
+| Behavior | Scenario | Functional test |
+|----------|----------|-----------------|
+| Idempotency | Duplicate problem title → 409 | `test_problems.py::test_fr1_create_problem_duplicate_title_409` |
+| Idempotency | Identical code re-submitted within 30s → 409 duplicate | `test_submissions.py::test_fr4_submit_duplicate_409` |
+| Authorization | Unauthenticated create/submit/history → 401 | `test_problems.py::test_fr1_create_problem_unauthenticated_401`, `test_submissions.py::test_fr4_submit_unauthenticated_401`, `test_submissions.py::test_fr7_submission_history_unauthenticated_401` |
+| Authorization | Non-admin problem create → 403 | `test_problems.py::test_fr1_create_problem_non_admin_403` |
+| Ownership | Reading another user's submission → 403; history is per-user | `test_submissions.py::test_fr5_get_submission_cross_user_403`, `test_submissions.py::test_fr7_submission_history_other_user_isolation` |
+| Validation | Missing title / empty test_cases / missing fields / unsupported language → 422 | `test_problems.py::test_fr1_create_problem_missing_title_422`, `test_problems.py::test_fr1_create_problem_empty_test_cases_422`, `test_submissions.py::test_fr4_submit_missing_fields_422`, `test_submissions.py::test_fr4_submit_unsupported_language_422` |
+| Validation | Invalid difficulty filter → 422; missing problem_id on history → 422 | `test_problems.py::test_fr2_list_problems_invalid_difficulty_422`, `test_submissions.py::test_fr7_submission_history_missing_problem_id_422` |
+| Error paths | Unknown problem / submission → 404 | `test_problems.py::test_fr3_get_problem_not_found_404`, `test_submissions.py::test_fr4_submit_unknown_problem_404`, `test_submissions.py::test_fr5_get_submission_not_found_404` |
+| Pagination | All list endpoints honor page/limit with total count | `test_problems.py::test_fr2_list_problems_pagination`, `test_submissions.py::test_fr7_submission_history_paginated`, `test_leaderboard.py::test_fr8_leaderboard_pagination` |
+| Filtering | Difficulty and tag filters narrow results | `test_problems.py::test_fr2_list_problems_filter_by_difficulty`, `test_problems.py::test_fr2_list_problems_filter_by_tag` |
+| Ordering | History most-recent-first; leaderboard solved DESC + earliest-tie-break | `test_submissions.py::test_fr7_submission_history_paginated`, `test_leaderboard.py` |
+| Empty states | Empty history and empty leaderboard return 200 with empty items | `test_submissions.py::test_fr7_submission_history_empty`, `test_leaderboard.py::test_fr8_leaderboard_empty` |
+| Liveness | `/healthz` returns `{"status": "ok"}` | `tests/test_health.py::test_healthz_returns_ok` |
+
+The service-layer edge cases (idempotency-key computation, verdict transitions, tie-break
+SQL, JWT validation) are additionally covered white-box in `tests/unit/`.
+
+## 9. Test Results
+
+All three suites run in GitHub Actions on every push to `main`, on every pull request,
+and on a daily schedule. Current status:
+
+[![Lint](https://github.com/iliazlobin/sd-leetcode-backend-mvp/actions/workflows/lint.yml/badge.svg)](https://github.com/iliazlobin/sd-leetcode-backend-mvp/actions/workflows/lint.yml)
+[![CI](https://github.com/iliazlobin/sd-leetcode-backend-mvp/actions/workflows/ci.yml/badge.svg)](https://github.com/iliazlobin/sd-leetcode-backend-mvp/actions/workflows/ci.yml)
+[![Functional](https://github.com/iliazlobin/sd-leetcode-backend-mvp/actions/workflows/functional.yml/badge.svg)](https://github.com/iliazlobin/sd-leetcode-backend-mvp/actions/workflows/functional.yml)
+
+| Workflow | Runs | What it verifies |
+|----------|------|------------------|
+| [Lint](https://github.com/iliazlobin/sd-leetcode-backend-mvp/actions/workflows/lint.yml) | `ruff` 0.8.0 over the whole tree | Style + static checks are clean |
+| [CI](https://github.com/iliazlobin/sd-leetcode-backend-mvp/actions/workflows/ci.yml) | `unit` job: `pytest tests/unit/`; `e2e` job: Alembic migrations against PostgreSQL 16 + Redis 7 service containers, boots `uvicorn`, waits for `/healthz`, then runs the black-box acceptance suite `pytest verify/acceptance/` over HTTP | Service-layer logic, plus every FR-1…FR-8 acceptance contract against the live system (including judge execution) |
+| [Functional](https://github.com/iliazlobin/sd-leetcode-backend-mvp/actions/workflows/functional.yml) | `pytest tests/functional/` in-process (ASGITransport) against PostgreSQL 16 + Redis 7 service containers | The HTTP contract and cross-cutting behaviors in §8 |
+
+## 10. Run & Test Locally
+
+```bash
+# Start the stack (requires Docker)
+docker compose up --build -d
+
+# Run migrations + seed data (admin + regular users)
+docker compose exec app alembic upgrade head
+
+# Verify health
+curl http://localhost:${APP_PORT:-8010}/healthz
+
+# Obtain a token
+curl -X POST http://localhost:${APP_PORT:-8010}/auth/token \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"admin123"}'
+
+# Run white-box tests
+pip install -e ".[dev]"
+pytest tests/unit/ tests/functional/ -v
+
+# Run black-box acceptance against the running stack
+API_BASE_URL=http://localhost:${APP_PORT:-8010} pytest verify/acceptance/ -v
+```
+
+See [README.md](README.md) for the quickstart and API reference, and
+[DEPLOY.md](DEPLOY.md) for full deployment and teardown steps.

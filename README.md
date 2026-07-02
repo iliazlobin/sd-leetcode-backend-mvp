@@ -155,7 +155,7 @@ All three layers pass in CI — see status badges above.
 ├── docker-compose.yml     # db + redis + app services
 ├── pyproject.toml         # Dependencies + tool config
 ├── DEPLOY.md              # Deploy walkthrough
-├── SPEC.md                # Engineering spec (canonical source for Notion sync)
+├── SPEC.md                # Engineering spec (goals, FRs, stack)
 ├── DESIGN.md              # This build's design + functional spec
 └── .github/workflows/     # CI: lint (ruff 0.8.0), unit tests, functional tests
 ```
